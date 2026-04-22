@@ -1,0 +1,46 @@
+---
+# =============================================================================
+# Infisical secrets role — multi-project / multi-environment
+# Public fact: infisical_all_secrets[project][env][key]
+# =============================================================================
+
+# Infisical API URL
+infisical_api_url: "https://infisical.example.com/"
+
+# Name of the environment variable to read the token from
+infisical_token_env_var: "INFISICAL_TOKEN"
+
+# ─── Projects list ───────────────────────────────────────────────────────────
+#
+# infisical_projects:
+#   - id: "abc123"               # workspace/project ID in Infisical
+#     name: "my-project"         # key in infisical_all_secrets[name]
+#     environments: [prod]       # list of environments to fetch
+#     secret_specs:
+#       - path: "/"
+#         keys: []               # [] = all keys; or a list of specific keys
+infisical_projects: []
+
+# ─── Backwards compat (legacy single-project) ────────────────────────────────
+infisical_project_id: ""
+infisical_environment: "prod"
+infisical_secret_specs: []
+
+# ─── Fetch parameters ────────────────────────────────────────────────────────
+# Name of the project ID parameter in the Infisical API URL.
+# API accepts: workspaceId or projectSlug
+infisical_id_param: "workspaceId"
+infisical_validate_certs: true
+infisical_fail_on_missing: true
+infisical_fetch_delegate: localhost
+infisical_fetch_run_once: true
+infisical_fetch_become: false
+
+# ─── Distribution ────────────────────────────────────────────────────────────
+# Copy infisical_all_secrets to all hosts in the play
+infisical_distribute_facts: true
+
+# ─── Security and debugging ──────────────────────────────────────────────────
+infisical_no_log: true
+infisical_debug: false
+infisical_show_summary: true

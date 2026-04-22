@@ -1,0 +1,340 @@
+---
+# =============================================================================
+# Infisical secrets — multi-project / multi-environment
+# Single public fact: infisical_all_secrets[project][env][key]
+# =============================================================================
+
+# ─── 1. Token ────────────────────────────────────────────────────────────────
+
+- name: Read Infisical token from environment variable
+  set_fact:
+    infisical_token: "{{ lookup('env', infisical_token_env_var) | default('', true) }}"
+  tags: [infisical]
+  no_log: "{{ infisical_no_log }}"
+
+- name: Fail if Infisical token is missing
+  fail:
+    msg: "Infisical token not found in environment variable '{{ infisical_token_env_var }}'"
+  when: infisical_token | length == 0
+  tags: [infisical]
+  no_log: false
+
+# ─── 2. Backwards compat: legacy single-project → infisical_projects ─────────
+
+- name: Convert legacy single-project config to infisical_projects format
+  set_fact:
+    infisical_projects:
+      - id: "{{ infisical_project_id }}"
+        name: "default"
+        environments:
+          - "{{ infisical_environment }}"
+        secret_specs: "{{ infisical_secret_specs if infisical_secret_specs | length > 0 else [{'path': '/', 'keys': []}] }}"
+  when:
+    - infisical_projects | default([]) | length == 0
+    - infisical_project_id | default('') not in ['', 'CHANGE_ME_PROJECT_ID']
+  tags: [infisical]
+  no_log: "{{ infisical_no_log }}"
+
+- name: Validate infisical_projects is not empty
+  assert:
+    that:
+      - infisical_projects | length > 0
+      - infisical_projects | selectattr('id', 'defined') | list | length > 0
+    fail_msg: >-
+      infisical_projects must be configured with at least one project.
+      Set infisical_projects list or (legacy) infisical_project_id.
+  tags: [infisical]
+
+# ─── 3. Build flat list of fetch specs ───────────────────────────────────────
+#  = cartesian product of projects × environments × secret_specs
+
+- name: Build flat fetch specs (projects × environments × paths)
+  set_fact:
+    _infisical_fetch_specs: |-
+      {%- set ns = namespace(specs=[]) -%}
+      {%- for project in infisical_projects -%}
+        {%- set pid = project.id | default('') -%}
+        {%- if pid not in ['', 'CHANGE_ME_PROJECT_ID'] -%}
+          {%- set pname = project.name | default(pid) -%}
+          {%- set envs  = project.environments | default(['prod']) -%}
+          {%- set paths = project.secret_specs | default([{'path': '/', 'keys': []}]) -%}
+          {%- for env in envs -%}
+            {%- for spec in paths -%}
+              {%- set ns.specs = ns.specs + [{
+                'project_id':   pid,
+                'project_name': pname,
+                'project_slug': project.slug | default(''),
+                'environment':  env,
+                'path':         spec.path | default('/'),
+                'keys':         spec['keys'] | default([])
+              }] -%}
+            {%- endfor -%}
+          {%- endfor -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ ns.specs }}
+  tags: [infisical]
+  delegate_to: "{{ infisical_fetch_delegate }}"
+  run_once: "{{ infisical_fetch_run_once }}"
+  no_log: "{{ infisical_no_log }}"
+
+- name: Debug fetch specs
+  debug:
+    msg: "Fetch specs ({{ _infisical_fetch_specs | length }}): {{ _infisical_fetch_specs | map(attribute='project_name') | zip(_infisical_fetch_specs | map(attribute='environment')) | map('join', '/') | list }}"
+  when: infisical_debug | bool
+  tags: [infisical, infisical_debug]
+  delegate_to: "{{ infisical_fetch_delegate }}"
+  run_once: "{{ infisical_fetch_run_once }}"
+
+# ─── 4. Fetch secrets ────────────────────────────────────────────────────────
+# This version of Infisical accepts only workspaceId (project UUID).
+
+- name: Fetch secrets from Infisical
+  vars:
+    _spec: "{{ item }}"
+    _path_q: "{{ '/' if _spec.path | default('/') in ['', '/'] else _spec.path }}"
+    _url: >-
+      {{ infisical_api_url.rstrip('/') }}/api/v3/secrets/raw?workspaceId={{ _spec.project_id | urlencode }}&environment={{ _spec.environment | urlencode }}&secretPath={{ _path_q | urlencode }}&include_imports=true
+  uri:
+    url: "{{ _url | trim }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ infisical_token }}"
+      Accept: application/json
+    return_content: true
+    status_code: [200, 400, 401, 403, 404, 422]
+    timeout: 30
+    validate_certs: "{{ infisical_validate_certs | default(true) }}"
+  register: _infisical_raw_results
+  loop: "{{ _infisical_fetch_specs }}"
+  loop_control:
+    label: "{{ item.project_name }}/{{ item.environment }}{{ item.path }}"
+  tags: [infisical]
+  no_log: "{{ infisical_no_log and not infisical_debug }}"
+  delegate_to: "{{ infisical_fetch_delegate }}"
+  become: "{{ infisical_fetch_become }}"
+  run_once: "{{ infisical_fetch_run_once }}"
+
+# Show HTTP status codes and key count per request (without values)
+- name: DEBUG — HTTP responses per project/env
+  debug:
+    msg: |
+      ─── Infisical HTTP responses ───────────────────────────────────────
+      {% for r in _infisical_raw_results.results %}
+      {% set parsed = r.json | default({}) %}
+      {% set sl = parsed.get('secrets', (parsed.get('data') or {}).get('secrets', [])) %}
+      {{ r.item.project_name }}/{{ r.item.environment }}  id={{ r.item.project_id }}
+        status={{ r.status }}
+        url={{ r.url | default('?') }}
+        keys_found={{ sl | length }}
+        first_3_keys={{ sl[:3] | map(attribute='secretKey') | list }}
+        error={{ parsed.get('message', '') }}
+      {% endfor %}
+      ────────────────────────────────────────────────────────────────────
+      {% set ns = namespace(fingerprints=[]) %}
+      {% for r in _infisical_raw_results.results %}
+      {% set parsed = r.json | default({}) %}
+      {% set sl = parsed.get('secrets', (parsed.get('data') or {}).get('secrets', [])) %}
+      {% set fp = sl | map(attribute='secretKey') | list | sort | join(',') %}
+      {% if fp in ns.fingerprints and fp | length > 0 %}
+      ⚠️  DUPLICATE: "{{ r.item.project_name }}" returned the same keys as a previous project!
+         Machine Identity is not added to this project in Infisical UI.
+         → Infisical UI → project "{{ r.item.project_name }}" → Access Control → Machine Identities → Add
+      {% else %}
+      {% set ns.fingerprints = ns.fingerprints + [fp] %}
+      {% endif %}
+      {% endfor %}
+  when: infisical_debug | bool
+  tags: [infisical, infisical_debug]
+  delegate_to: "{{ infisical_fetch_delegate }}"
+  run_once: "{{ infisical_fetch_run_once }}"
+  no_log: false
+
+# Fallback: /api/v3/secrets (old endpoint) if /raw returned non-200
+- name: Fallback fetch (v3/secrets endpoint) for non-200 specs
+  vars:
+    _spec: "{{ item.item }}"
+    _path_q: "{{ '/' if _spec.path | default('/') in ['', '/'] else _spec.path }}"
+    _url_fb: >-
+      {{ infisical_api_url.rstrip('/') }}/api/v3/secrets?workspaceId={{ _spec.project_id | urlencode }}&environment={{ _spec.environment | urlencode }}&secretPath={{ _path_q | urlencode }}&include_imports=true
+  uri:
+    url: "{{ _url_fb | trim }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ infisical_token }}"
+      Accept: application/json
+    return_content: true
+    status_code: [200, 400, 401, 403, 404, 422]
+    timeout: 30
+    validate_certs: "{{ infisical_validate_certs | default(true) }}"
+  register: _infisical_fallback_results
+  loop: "{{ _infisical_raw_results.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.project_name }}/{{ item.item.environment }}{{ item.item.path }}"
+  when: item.status | default(0) not in [200]
+  tags: [infisical]
+  no_log: "{{ infisical_no_log and not infisical_debug }}"
+  delegate_to: "{{ infisical_fetch_delegate }}"
+  become: "{{ infisical_fetch_become }}"
+  run_once: "{{ infisical_fetch_run_once }}"
+
+# ─── 5. Parse → infisical_all_secrets[project][env][key] ────────────────────
+#
+# Why a loop instead of a single set_fact:
+#   result[pname].update({env: {}}) mutates a COPY, not the original inside result.
+#   Nested mutation via .update() is unreliable in Ansible Jinja2.
+#   Solution: loop + combine(recursive=True) builds the dict iteratively.
+
+- name: "Initialize infisical_all_secrets"
+  set_fact:
+    infisical_all_secrets: {}
+  tags: [infisical]
+  delegate_to: "{{ infisical_fetch_delegate }}"
+  run_once: "{{ infisical_fetch_run_once }}"
+  no_log: "{{ infisical_no_log }}"
+
+- name: "Parse response → infisical_all_secrets[project][env][key]"
+  vars:
+    _pname: "{{ item.project_name }}"
+    _env:   "{{ item.environment }}"
+    # The uri module automatically parses the JSON response into the .json field — no from_json/startswith needed
+    _parsed: "{{ _infisical_raw_results.results[_idx].json | default({}) }}"
+    _primary_sl: >-
+      {{ _parsed.get('secrets', (_parsed.get('data') or {}).get('secrets', [])) }}
+    # Fallback: look for a successful response from fallback results for this spec
+    _fallback_sl: >-
+      {%- set ns = namespace(sl=[]) -%}
+      {%- for fb in _infisical_fallback_results.results | default([]) -%}
+        {%- if ns.sl | length == 0
+               and not (fb.skipped | default(false))
+               and fb.status | default(0) == 200
+               and fb.item is defined
+               and fb.item.item is defined -%}
+          {%- set spec = fb.item.item -%}
+          {%- if spec.project_name == item.project_name
+                 and spec.environment == item.environment
+                 and spec.path == item.path -%}
+            {%- set fb_parsed = fb.json | default({}) -%}
+            {%- set ns.sl = fb_parsed.get('secrets', (fb_parsed.get('data') or {}).get('secrets', [])) -%}
+          {%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ ns.sl }}
+    _sl: "{{ _primary_sl if (_primary_sl | length > 0) else _fallback_sl }}"
+  set_fact:
+    # combine(recursive=True) creates a NEW dict — does not mutate nested objects
+    infisical_all_secrets: |-
+      {%- set pname = item.project_name -%}
+      {%- set env   = item.environment -%}
+      {%- set kf    = item.get('keys', []) -%}
+      {%- set ns    = namespace(kv={}) -%}
+      {%- for so in _sl -%}
+        {%- if so is mapping -%}
+          {%- set kname = so.secretKey | default(so.key | default('')) | string -%}
+          {%- if kname | length > 0 and (kf | length == 0 or kname in kf) -%}
+            {%- set val = so.secretValue | default(so.value | default(so.plainTextValue | default(''))) | string -%}
+            {%- set ns.kv = ns.kv | combine({kname: val}) -%}
+          {%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ (infisical_all_secrets | default({})) | combine(
+           {pname: ((infisical_all_secrets | default({})).get(pname, {}) | combine({env: ns.kv}))},
+           recursive=True
+         ) }}
+  loop: "{{ _infisical_fetch_specs }}"
+  loop_control:
+    index_var: _idx
+    label: "{{ item.project_name }}/{{ item.environment }}"
+  tags: [infisical]
+  no_log: "{{ infisical_no_log and not infisical_debug }}"
+  delegate_to: "{{ infisical_fetch_delegate }}"
+  become: "{{ infisical_fetch_become }}"
+  run_once: "{{ infisical_fetch_run_once }}"
+
+# ─── 6. Check required keys ──────────────────────────────────────────────────
+
+- name: Check for missing required keys
+  set_fact:
+    _infisical_missing: |-
+      {%- set ns = namespace(missing=[]) -%}
+      {%- for project in infisical_projects -%}
+        {%- set pname = project.name | default(project.id) -%}
+        {%- set envs  = project.environments | default(['prod']) -%}
+        {%- set specs = project.secret_specs | default([]) -%}
+        {%- for env in envs -%}
+          {%- for spec in specs -%}
+            {%- set keys_wanted = spec['keys'] | default([]) -%}
+            {%- if keys_wanted | length > 0 -%}
+              {%- set available = infisical_all_secrets.get(pname, {}).get(env, {}) -%}
+              {%- for k in keys_wanted -%}
+                {%- if k not in available -%}
+                  {%- set ns.missing = ns.missing + [pname ~ '/' ~ env ~ '/' ~ k] -%}
+                {%- endif -%}
+              {%- endfor -%}
+            {%- endif -%}
+          {%- endfor -%}
+        {%- endfor -%}
+      {%- endfor -%}
+      {{ ns.missing }}
+  tags: [infisical]
+  delegate_to: "{{ infisical_fetch_delegate }}"
+  run_once: "{{ infisical_fetch_run_once }}"
+  no_log: "{{ infisical_no_log }}"
+
+- name: Fail if required secrets are missing
+  fail:
+    msg: "Missing required Infisical secrets: {{ _infisical_missing }}"
+  when:
+    - infisical_fail_on_missing | bool
+    - _infisical_missing | length > 0
+  tags: [infisical]
+  run_once: "{{ infisical_fetch_run_once }}"
+  delegate_to: "{{ infisical_fetch_delegate }}"
+  no_log: false
+
+# ─── 7. Distribute infisical_all_secrets to all play hosts ───────────────────
+
+- name: Distribute infisical_all_secrets to all hosts
+  set_fact:
+    infisical_all_secrets: "{{ hostvars[ansible_play_hosts_all[0]].infisical_all_secrets | default({}) }}"
+  when:
+    - infisical_distribute_facts | bool
+    - hostvars[ansible_play_hosts_all[0]].infisical_all_secrets is defined
+  tags: [infisical]
+  no_log: "{{ infisical_no_log }}"
+
+# ─── 8. Summary ──────────────────────────────────────────────────────────────
+
+- name: Infisical secrets summary
+  debug:
+    msg: |
+      ╔══ Infisical secrets loaded ═══════════════════════════════════╗
+      {% for pname, envs in infisical_all_secrets.items() %}┌─ Project: {{ pname }}
+      {% for env, kv in envs.items() %}  [{{ env }}] {{ kv | length }} keys: {{ kv.keys() | list | sort | join(', ') }}
+      {% endfor %}{% endfor %}╚═══════════════════════════════════════════════════════════════╝
+      Missing: {{ _infisical_missing | default([]) }}
+      {% set ns = namespace(seen=[]) %}
+      {% for pname, envs in infisical_all_secrets.items() %}{% for env, kv in envs.items() %}{% set fp = kv.keys() | list | sort | join(',') %}{% if fp in ns.seen and fp | length > 0 %}
+      ⚠️  "{{ pname }}/{{ env }}" has IDENTICAL keys as another project → token is scoped to 1 project only!
+         Run with infisical_debug=true for details.
+      {% else %}{% set ns.seen = ns.seen + [fp] %}{% endif %}{% endfor %}{% endfor %}
+  when: infisical_show_summary | bool
+  tags: [infisical]
+  run_once: "{{ infisical_fetch_run_once }}"
+  no_log: false
+
+# ─── 9. Debug dump with values ───────────────────────────────────────────────
+
+- name: DEBUG — dump all secrets with values
+  debug:
+    msg: |
+      ╔══ INFISICAL DEBUG SECRETS DUMP ═══════════════════════════════╗
+      {% for pname, envs in infisical_all_secrets.items() %}┌─ Project: {{ pname }}
+      {% for env, kv in envs.items() %}  ┌── [{{ env }}]
+      {% for k in kv.keys() | list | sort %}  │  {{ k }}={{ kv[k] }}
+      {% endfor %}{% endfor %}{% endfor %}╚═══════════════════════════════════════════════════════════════╝
+  when: infisical_debug | bool
+  tags: [infisical, infisical_debug]
+  run_once: "{{ infisical_fetch_run_once }}"
+  no_log: false
+
