@@ -72,7 +72,7 @@ infisical_projects:
     secret_specs:
       - path: "/"
         keys: []
-
+  
   - id: "be5f257d-1b4d-431b-a1b8-c968500c7b47"
     name: "frontend"
     environments: [prod]
